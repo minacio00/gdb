@@ -168,6 +168,7 @@ func (db *Database) loadExistingData() error {
 		}
 
 		db.tree.ReplaceOrInsert(item)
+		//if this condition does not get satifies it means there is no more pages in the diskj
 		if pageID >= db.nextPageID {
 			db.nextPageID = pageID + 1
 		}
