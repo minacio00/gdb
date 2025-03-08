@@ -32,6 +32,7 @@ func NewDatabase(path string, pageSize int) (*Database, error) {
 
 	return db, nil
 }
+func(db *Database) CreateTable()
 
 // Insert adds a new record to the database
 func (db *Database) Insert(key int64, value []byte) error {
