@@ -33,33 +33,158 @@ func NewDatabase(path string, pageSize int) (*Database, error) {
 
 	return db, nil
 }
-func (db *Database) CreateTable(table *Table) error {
-	Tid := db.nextTableID
-	table.ID = Tid
+func (db *Database) CreateTable(tableName string, columns []Column, primaryKey string) error {
+	db.mu.Lock()
+	defer db.mu.Unlock()
+
+	// Check if table already exists
+	if _, exists := db.tables[tableName]; exists {
+		return fmt.Errorf("table already exists: %s", tableName)
+	}
+
+	// Validate primary key
+	if primaryKey != "" {
+		hasPK := false
+		for _, col := range columns {
+			if col.Name == primaryKey {
+				hasPK = true
+				break
+			}
+		}
+		if !hasPK {
+			return fmt.Errorf("primary key column not found: %s", primaryKey)
+		}
+	}
+
+	// Create table object
+	table := &Table{
+		ID:      db.nextTableID,
+		Name:    tableName,
+		Columns: columns,
+		PK:      primaryKey,
+	}
+	db.nextTableID++
+
+	// Create a B-tree index for this table
+	db.rowIndices[table.Name] = btree.New(32)
+
+	// Create table metadata page
+	tablePage := &Page{
+		ID:   db.nextPageID,
+		Data: make([]byte, db.pageSize),
+	}
+	db.nextPageID++
+
+	// Initialize page header
+	tablePage.Data[0] = byte(PTTable)
+	binary.LittleEndian.PutUint32(tablePage.Data[1:5], table.ID)
+	binary.LittleEndian.PutUint16(tablePage.Data[5:7], 0)    // RowCount is always 0 for table pages
+	binary.LittleEndian.PutUint64(tablePage.Data[7:15], 0)   // No next page initially
+	binary.LittleEndian.PutUint16(tablePage.Data[15:17], 17) // Free offset starts after header
+
+	// Serialize table schema
+	if err := serializeTable(table, tablePage); err != nil {
+		return fmt.Errorf("failed to serialize table: %w", err)
+	}
+
+	// Create first data page for this table
+	dataPage := &Page{
+		ID:   db.nextPageID,
+		Data: make([]byte, db.pageSize),
+	}
+	db.nextPageID++
+
+	// Initialize data page header
+	dataPage.Data[0] = byte(PTData)
+	binary.LittleEndian.PutUint32(dataPage.Data[1:5], table.ID)
+	binary.LittleEndian.PutUint16(dataPage.Data[5:7], 0)    // No rows yet
+	binary.LittleEndian.PutUint64(dataPage.Data[7:15], 0)   // No next page yet
+	binary.LittleEndian.PutUint16(dataPage.Data[15:17], 17) // Free offset starts after header
+
+	// Update table with page IDs
+	table.FirstPageID = dataPage.ID
+	table.LastPageID = dataPage.ID
+
+	// Write pages to disk
+	if err := db.writePage(tablePage); err != nil {
+		return fmt.Errorf("failed to write table page: %w", err)
+	}
+
+	if err := db.writePage(dataPage); err != nil {
+		return fmt.Errorf("failed to write data page: %w", err)
+	}
+
+	// Add table to in-memory maps
+	db.tables[table.Name] = table
+	db.tableIDMap[table.Name] = table
 
 	return nil
 }
-func newPage(id uint64, ptype PageType, TId *uint32, data []byte) *Page {
-	header := &PageHeader{
-		Type:     ptype,
-		TableID:  *TId,
-		RowCount: 0,
-	}
-	page := &Page{
-		ID: id,
-	}
-	//serialize header
-	page.Data[0] = byte(header.Type)
-	binary.LittleEndian.PutUint32(page.Data[1:5], header.TableID)
-	binary.LittleEndian.PutUint16(page.Data[5:7], header.RowCount)
-	binary.LittleEndian.PutUint64(page.Data[7:15], header.nextPageID)
-	binary.LittleEndian.PutUint16(page.Data[15:17], header.FreeOffset)
-	switch ptype {
-	case PTTable:
-		serializeTable()
+
+func deserializeTable(page *Page) (*Table, error) {
+	// Start after page header
+	offset := uint16(17)
+
+	// Read table ID from page header
+	tableID := binary.LittleEndian.Uint32(page.Data[1:5])
+
+	// Read table name length
+	nameLen := binary.LittleEndian.Uint16(page.Data[offset : offset+2])
+	offset += 2
+
+	// Read table name
+	tableName := string(page.Data[offset : offset+nameLen])
+	offset += nameLen
+
+	// Read number of columns
+	colCount := binary.LittleEndian.Uint16(page.Data[offset : offset+2])
+	offset += 2
+
+	// Read primary key name length
+	pkLen := binary.LittleEndian.Uint16(page.Data[offset : offset+2])
+	offset += 2
+
+	// Read primary key name
+	primaryKey := string(page.Data[offset : offset+pkLen])
+	offset += pkLen
+
+	// Read columns
+	columns := make([]Column, colCount)
+	for i := range columns {
+		// Read column name length
+		colNameLen := binary.LittleEndian.Uint16(page.Data[offset : offset+2])
+		offset += 2
+
+		// Read column name
+		colName := string(page.Data[offset : offset+colNameLen])
+		offset += colNameLen
+
+		// Read column type
+		colType := ColumnType(page.Data[offset])
+		offset++
+
+		// Read column flags
+		notNull := page.Data[offset] != 0
+		offset++
+
+		columns[i] = Column{
+			Name:    colName,
+			Type:    colType,
+			NotNull: notNull,
+		}
 	}
 
+	// Create and return table
+	table := &Table{
+		ID:      tableID,
+		Name:    tableName,
+		Columns: columns,
+		PK:      primaryKey,
+	}
+
+	return table, nil
 }
+
 func serializeTable(table *Table, page *Page) error {
 	offset := uint16(17)
 	nameLen := uint16(len(table.Name))
@@ -109,77 +234,6 @@ func serializeTable(table *Table, page *Page) error {
 	return nil
 
 }
-func NewPageHeader(ptype PageType, TId *uint32) *PageHeader {
-	return &PageHeader{
-		Type:     ptype,
-		TableID:  *TId,
-		RowCount: 0,
-	}
-
-}
-
-// // Insert adds a new record to the database
-// func (db *Database) Insert(key int64, value []byte) error {
-// 	db.mu.Lock()
-// 	defer db.mu.Unlock()
-
-// 	// Create new item
-// 	item := &Item{
-// 		Key:   key,
-// 		Value: value,
-// 	}
-
-// 	// Allocate new page for the item
-// 	page := &Page{
-// 		ID:   db.nextPageID,
-// 		Data: make([]byte, db.pageSize),
-// 	}
-// 	db.nextPageID++
-
-// 	// Serialize item into page
-// 	if err := db.serializeItem(item, page); err != nil {
-// 		return fmt.Errorf("failed to serialize item: %w", err)
-// 	}
-
-// 	// Write page to disk
-// 	if err := db.writePage(page); err != nil {
-// 		return fmt.Errorf("failed to write page: %w", err)
-// 	}
-
-// 	// Update item with page reference
-// 	item.pageID = page.ID
-
-// 	// Insert into in-memory B-tree
-// 	db.tree.ReplaceOrInsert(item)
-
-// 	return nil
-// }
-
-// Get retrieves a record by key
-// func (db *Database) Get(key int64) ([]byte, error) {
-// 	db.mu.RLock()
-// 	defer db.mu.RUnlock()
-
-// 	// Search in B-tree
-// 	item := db.tree.Get(&Item{Key: key})
-// 	if item == nil {
-// 		return nil, fmt.Errorf("key not found: %d", key)
-// 	}
-
-// 	// Load page from disk
-// 	page, err := db.readPage(item.(*Item).pageID)
-// 	if err != nil {
-// 		return nil, fmt.Errorf("failed to read page: %w", err)
-// 	}
-
-// 	// Deserialize item from page
-// 	deserializedItem, err := db.deserializeItem(page)
-// 	if err != nil {
-// 		return nil, fmt.Errorf("failed to deserialize item: %w", err)
-// 	}
-
-// 	return deserializedItem.Value, nil
-// }
 
 // writePage writes a page to disk
 func (db *Database) writePage(page *Page) error {
@@ -202,35 +256,6 @@ func (db *Database) readPage(pageID uint64) (*Page, error) {
 	}
 
 	return page, nil
-}
-
-// serializeItem serializes an item into a page
-func (db *Database) serializeItem(item *Item, page *Page) error {
-	// Format: [key(8 bytes)][value_length(4 bytes)][value(N bytes)]
-	if 8+4+len(item.Value) > db.pageSize {
-		return fmt.Errorf("item too large for page")
-	}
-
-	binary.LittleEndian.PutUint64(page.Data[0:8], uint64(item.Key))
-	binary.LittleEndian.PutUint32(page.Data[8:12], uint32(len(item.Value)))
-	copy(page.Data[12:], item.Value)
-
-	return nil
-}
-
-// deserializeItem deserializes an item from a page
-func (db *Database) deserializeItem(page *Page) (*Item, error) {
-	key := int64(binary.LittleEndian.Uint64(page.Data[0:8]))
-	valueLen := binary.LittleEndian.Uint32(page.Data[8:12])
-
-	value := make([]byte, valueLen)
-	copy(value, page.Data[12:12+valueLen])
-
-	return &Item{
-		Key:    key,
-		Value:  value,
-		pageID: page.ID,
-	}, nil
 }
 
 // loadExistingData loads existing database content into memory
