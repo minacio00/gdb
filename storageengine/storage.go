@@ -14,13 +14,14 @@ func NewDatabase(path string, pageSize int) (*Database, error) {
 	if err != nil {
 		return nil, fmt.Errorf("failed to open database file: %w", err)
 	}
-
 	db := &Database{
-		file:     file,
-		tree:     btree.New(32), // degree of 32 works well for most cases
-		pageSize: pageSize,
+		file:        file,
+		nextPageID:  0,
+		tables:      make(map[string]*Table),
+		tableIDMap:  make(map[string]*Table),
+		rowIndices:  make(map[string]*btree.BTree),
+		nextTableID: 1,
 	}
-
 	// Initialize or load existing database
 	if info, err := file.Stat(); err != nil {
 		return nil, err
@@ -32,70 +33,153 @@ func NewDatabase(path string, pageSize int) (*Database, error) {
 
 	return db, nil
 }
-func(db *Database) CreateTable()
-
-// Insert adds a new record to the database
-func (db *Database) Insert(key int64, value []byte) error {
-	db.mu.Lock()
-	defer db.mu.Unlock()
-
-	// Create new item
-	item := &Item{
-		Key:   key,
-		Value: value,
-	}
-
-	// Allocate new page for the item
-	page := &Page{
-		ID:   db.nextPageID,
-		Data: make([]byte, db.pageSize),
-	}
-	db.nextPageID++
-
-	// Serialize item into page
-	if err := db.serializeItem(item, page); err != nil {
-		return fmt.Errorf("failed to serialize item: %w", err)
-	}
-
-	// Write page to disk
-	if err := db.writePage(page); err != nil {
-		return fmt.Errorf("failed to write page: %w", err)
-	}
-
-	// Update item with page reference
-	item.pageID = page.ID
-
-	// Insert into in-memory B-tree
-	db.tree.ReplaceOrInsert(item)
+func (db *Database) CreateTable(table *Table) error {
+	Tid := db.nextTableID
+	table.ID = Tid
 
 	return nil
 }
+func newPage(id uint64, ptype PageType, TId *uint32, data []byte) *Page {
+	header := &PageHeader{
+		Type:     ptype,
+		TableID:  *TId,
+		RowCount: 0,
+	}
+	page := &Page{
+		ID: id,
+	}
+	//serialize header
+	page.Data[0] = byte(header.Type)
+	binary.LittleEndian.PutUint32(page.Data[1:5], header.TableID)
+	binary.LittleEndian.PutUint16(page.Data[5:7], header.RowCount)
+	binary.LittleEndian.PutUint64(page.Data[7:15], header.nextPageID)
+	binary.LittleEndian.PutUint16(page.Data[15:17], header.FreeOffset)
+	switch ptype {
+	case PTTable:
+		serializeTable()
+	}
+
+}
+func serializeTable(table *Table, page *Page) error {
+	offset := uint16(17)
+	nameLen := uint16(len(table.Name))
+	// write table name lenght to the page
+	binary.LittleEndian.PutUint16(page.Data[offset:offset+2], nameLen)
+	offset += 2
+	copy(page.Data[offset:offset+nameLen], []byte(table.Name))
+	offset += nameLen
+
+	// write number of columns
+	colCount := uint16(len(table.Columns))
+	binary.LittleEndian.PutUint16(page.Data[offset:offset+2], colCount)
+	offset += 2
+
+	pkLen := uint16(len(table.PK))
+	binary.LittleEndian.PutUint16(page.Data[offset:offset+2], pkLen)
+	offset += 2
+
+	// Write primary key name
+	copy(page.Data[offset:offset+pkLen], table.PK)
+	offset += pkLen
+
+	for _, col := range table.Columns {
+		// Write column name length
+		colNameLen := uint16(len(col.Name))
+		binary.LittleEndian.PutUint16(page.Data[offset:offset+2], colNameLen)
+		offset += 2
+
+		// Write column name
+		copy(page.Data[offset:offset+colNameLen], col.Name)
+		offset += colNameLen
+
+		// Write column type
+		page.Data[offset] = byte(col.Type)
+		offset++
+
+		// Write column flags (NotNull for now)
+		if col.NotNull {
+			page.Data[offset] = 1
+		} else {
+			page.Data[offset] = 0
+		}
+		offset++
+	}
+	binary.LittleEndian.PutUint16(page.Data[15:17], offset)
+
+	return nil
+
+}
+func NewPageHeader(ptype PageType, TId *uint32) *PageHeader {
+	return &PageHeader{
+		Type:     ptype,
+		TableID:  *TId,
+		RowCount: 0,
+	}
+
+}
+
+// // Insert adds a new record to the database
+// func (db *Database) Insert(key int64, value []byte) error {
+// 	db.mu.Lock()
+// 	defer db.mu.Unlock()
+
+// 	// Create new item
+// 	item := &Item{
+// 		Key:   key,
+// 		Value: value,
+// 	}
+
+// 	// Allocate new page for the item
+// 	page := &Page{
+// 		ID:   db.nextPageID,
+// 		Data: make([]byte, db.pageSize),
+// 	}
+// 	db.nextPageID++
+
+// 	// Serialize item into page
+// 	if err := db.serializeItem(item, page); err != nil {
+// 		return fmt.Errorf("failed to serialize item: %w", err)
+// 	}
+
+// 	// Write page to disk
+// 	if err := db.writePage(page); err != nil {
+// 		return fmt.Errorf("failed to write page: %w", err)
+// 	}
+
+// 	// Update item with page reference
+// 	item.pageID = page.ID
+
+// 	// Insert into in-memory B-tree
+// 	db.tree.ReplaceOrInsert(item)
+
+// 	return nil
+// }
 
 // Get retrieves a record by key
-func (db *Database) Get(key int64) ([]byte, error) {
-	db.mu.RLock()
-	defer db.mu.RUnlock()
+// func (db *Database) Get(key int64) ([]byte, error) {
+// 	db.mu.RLock()
+// 	defer db.mu.RUnlock()
 
-	// Search in B-tree
-	item := db.tree.Get(&Item{Key: key})
-	if item == nil {
-		return nil, fmt.Errorf("key not found: %d", key)
-	}
+// 	// Search in B-tree
+// 	item := db.tree.Get(&Item{Key: key})
+// 	if item == nil {
+// 		return nil, fmt.Errorf("key not found: %d", key)
+// 	}
 
-	// Load page from disk
-	page, err := db.readPage(item.(*Item).pageID)
-	if err != nil {
-		return nil, fmt.Errorf("failed to read page: %w", err)
-	}
+// 	// Load page from disk
+// 	page, err := db.readPage(item.(*Item).pageID)
+// 	if err != nil {
+// 		return nil, fmt.Errorf("failed to read page: %w", err)
+// 	}
 
-	// Deserialize item from page
-	deserializedItem, err := db.deserializeItem(page)
-	if err != nil {
-		return nil, fmt.Errorf("failed to deserialize item: %w", err)
-	}
+// 	// Deserialize item from page
+// 	deserializedItem, err := db.deserializeItem(page)
+// 	if err != nil {
+// 		return nil, fmt.Errorf("failed to deserialize item: %w", err)
+// 	}
 
-	return deserializedItem.Value, nil
-}
+// 	return deserializedItem.Value, nil
+// }
 
 // writePage writes a page to disk
 func (db *Database) writePage(page *Page) error {
@@ -158,21 +242,21 @@ func (db *Database) loadExistingData() error {
 
 	numPages := fileInfo.Size() / int64(db.pageSize)
 	for pageID := uint64(0); pageID < uint64(numPages); pageID++ {
-		page, err := db.readPage(pageID)
+		_, err := db.readPage(pageID)
 		if err != nil {
 			return err
 		}
 
-		item, err := db.deserializeItem(page)
-		if err != nil {
-			return err
-		}
+		// item, err := db.deserializeItem(page)
+		// if err != nil {
+		// 	return err
+		// }
 
-		db.tree.ReplaceOrInsert(item)
-		//if this condition does not get satifies it means there is no more pages in the diskj
-		if pageID >= db.nextPageID {
-			db.nextPageID = pageID + 1
-		}
+		// db.tree.ReplaceOrInsert(item)
+		// //if this condition does not get satifies it means there is no more pages in the diskj
+		// if pageID >= db.nextPageID {
+		// 	db.nextPageID = pageID + 1
+		// }
 	}
 
 	return nil
