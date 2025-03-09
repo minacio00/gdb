@@ -1,3 +1,4 @@
+
 # GDB - A Simple Database Engine in Go
 
 GDB is a lightweight, educational database engine implemented in Go. It provides a simple yet powerful storage engine with key concepts from modern database systems including tables, rows, columns, pages, and typed data. This project was created for educational purposes to understand the inner workings of database systems.
