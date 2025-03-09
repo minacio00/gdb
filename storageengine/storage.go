@@ -14,14 +14,15 @@ func NewDatabase(path string, pageSize int) (*Database, error) {
 	if err != nil {
 		return nil, fmt.Errorf("failed to open database file: %w", err)
 	}
-
 	db := &Database{
-		file:     file,
-		tree:     btree.New(32), // degree of 32 works well for most cases
-		pageSize: pageSize,
+		file:        file,
+		pageSize:    pageSize,
+		nextPageID:  0,
+		tables:      make(map[string]*Table),
+		tableIDMap:  make(map[string]*Table),
+		rowIndices:  make(map[string]*btree.BTree),
+		nextTableID: 1,
 	}
-
-	// Initialize or load existing database
 	if info, err := file.Stat(); err != nil {
 		return nil, err
 	} else if info.Size() > 0 {
@@ -31,69 +32,6 @@ func NewDatabase(path string, pageSize int) (*Database, error) {
 	}
 
 	return db, nil
-}
-
-// Insert adds a new record to the database
-func (db *Database) Insert(key int64, value []byte) error {
-	db.mu.Lock()
-	defer db.mu.Unlock()
-
-	// Create new item
-	item := &Item{
-		Key:   key,
-		Value: value,
-	}
-
-	// Allocate new page for the item
-	page := &Page{
-		ID:   db.nextPageID,
-		Data: make([]byte, db.pageSize),
-	}
-	db.nextPageID++
-
-	// Serialize item into page
-	if err := db.serializeItem(item, page); err != nil {
-		return fmt.Errorf("failed to serialize item: %w", err)
-	}
-
-	// Write page to disk
-	if err := db.writePage(page); err != nil {
-		return fmt.Errorf("failed to write page: %w", err)
-	}
-
-	// Update item with page reference
-	item.pageID = page.ID
-
-	// Insert into in-memory B-tree
-	db.tree.ReplaceOrInsert(item)
-
-	return nil
-}
-
-// Get retrieves a record by key
-func (db *Database) Get(key int64) ([]byte, error) {
-	db.mu.RLock()
-	defer db.mu.RUnlock()
-
-	// Search in B-tree
-	item := db.tree.Get(&Item{Key: key})
-	if item == nil {
-		return nil, fmt.Errorf("key not found: %d", key)
-	}
-
-	// Load page from disk
-	page, err := db.readPage(item.(*Item).pageID)
-	if err != nil {
-		return nil, fmt.Errorf("failed to read page: %w", err)
-	}
-
-	// Deserialize item from page
-	deserializedItem, err := db.deserializeItem(page)
-	if err != nil {
-		return nil, fmt.Errorf("failed to deserialize item: %w", err)
-	}
-
-	return deserializedItem.Value, nil
 }
 
 // writePage writes a page to disk
@@ -119,35 +57,6 @@ func (db *Database) readPage(pageID uint64) (*Page, error) {
 	return page, nil
 }
 
-// serializeItem serializes an item into a page
-func (db *Database) serializeItem(item *Item, page *Page) error {
-	// Format: [key(8 bytes)][value_length(4 bytes)][value(N bytes)]
-	if 8+4+len(item.Value) > db.pageSize {
-		return fmt.Errorf("item too large for page")
-	}
-
-	binary.LittleEndian.PutUint64(page.Data[0:8], uint64(item.Key))
-	binary.LittleEndian.PutUint32(page.Data[8:12], uint32(len(item.Value)))
-	copy(page.Data[12:], item.Value)
-
-	return nil
-}
-
-// deserializeItem deserializes an item from a page
-func (db *Database) deserializeItem(page *Page) (*Item, error) {
-	key := int64(binary.LittleEndian.Uint64(page.Data[0:8]))
-	valueLen := binary.LittleEndian.Uint32(page.Data[8:12])
-
-	value := make([]byte, valueLen)
-	copy(value, page.Data[12:12+valueLen])
-
-	return &Item{
-		Key:    key,
-		Value:  value,
-		pageID: page.ID,
-	}, nil
-}
-
 // loadExistingData loads existing database content into memory
 func (db *Database) loadExistingData() error {
 	fileInfo, err := db.file.Stat()
@@ -156,21 +65,85 @@ func (db *Database) loadExistingData() error {
 	}
 
 	numPages := fileInfo.Size() / int64(db.pageSize)
+
+	// First pass: Load table definitions
 	for pageID := uint64(0); pageID < uint64(numPages); pageID++ {
 		page, err := db.readPage(pageID)
 		if err != nil {
-			return err
+			return fmt.Errorf("failed to read page %d: %w", pageID, err)
 		}
 
-		item, err := db.deserializeItem(page)
-		if err != nil {
-			return err
-		}
-
-		db.tree.ReplaceOrInsert(item)
-		//if this condition does not get satifies it means there is no more pages in the diskj
 		if pageID >= db.nextPageID {
 			db.nextPageID = pageID + 1
+		}
+
+		if len(page.Data) == 0 {
+			continue // Skip empty pages
+		}
+
+		pageType := PageType(page.Data[0])
+
+		if pageType == PTTable {
+			table, err := deserializeTable(page)
+			if err != nil {
+				return fmt.Errorf("failed to deserialize table on page %d: %w", pageID, err)
+			}
+
+			db.rowIndices[table.Name] = btree.New(32)
+
+			// Add table to maps
+			db.tables[table.Name] = table
+			db.tableIDMap[table.Name] = table
+
+			if table.ID >= db.nextTableID {
+				db.nextTableID = table.ID + 1
+			}
+		}
+	}
+
+	// Second pass: Process data pages and build indices
+	for pageID := uint64(0); pageID < uint64(numPages); pageID++ {
+		page, err := db.readPage(pageID)
+		if err != nil {
+			return fmt.Errorf("failed to read page %d: %w", pageID, err)
+		}
+
+		if len(page.Data) == 0 {
+			continue
+		}
+
+		pageType := PageType(page.Data[0])
+
+		if pageType == PTData {
+			// Extract table ID from page header
+			tableID := binary.LittleEndian.Uint32(page.Data[1:5])
+			nextPageID := binary.LittleEndian.Uint64(page.Data[7:15])
+
+			// Find corresponding table by ID
+			var targetTable *Table
+			for _, table := range db.tables {
+				if table.ID == tableID {
+					targetTable = table
+					break
+				}
+			}
+
+			if targetTable == nil {
+				return fmt.Errorf("data page %d references unknown table ID %d", pageID, tableID)
+			}
+
+			if targetTable.FirstPageID == 0 {
+				targetTable.FirstPageID = pageID
+			}
+
+			if nextPageID == 0 {
+				targetTable.LastPageID = pageID
+			}
+
+			err = db.indexRowsInPage(page, targetTable)
+			if err != nil {
+				return fmt.Errorf("failed to index rows in page %d: %w", pageID, err)
+			}
 		}
 	}
 
@@ -180,4 +153,38 @@ func (db *Database) loadExistingData() error {
 // Close closes the database
 func (db *Database) Close() error {
 	return db.file.Close()
+}
+
+// ListTables returns names of all tables in the database
+func (db *Database) ListTables() []string {
+	db.mu.RLock()
+	defer db.mu.RUnlock()
+
+	result := make([]string, 0, len(db.tables))
+	for name := range db.tables {
+		result = append(result, name)
+	}
+	return result
+}
+
+// GetRowCount returns the number of rows in a table
+func (db *Database) GetRowCount(tableName string) (int, error) {
+	db.mu.RLock()
+	defer db.mu.RUnlock()
+
+	index, exists := db.rowIndices[tableName]
+	if !exists {
+		return 0, fmt.Errorf("table not found: %s", tableName)
+	}
+
+	return index.Len(), nil
+}
+
+// hasEnoughSpace checks if a page has enough space for a value of given size
+func (db *Database) hasEnoughSpace(page *Page, neededSpace int) bool {
+	// Read free offset
+	freeOffset := binary.LittleEndian.Uint16(page.Data[15:17])
+
+	// Check if there's enough space (leave some margin for safety)
+	return int(freeOffset)+neededSpace+4 <= db.pageSize
 }
