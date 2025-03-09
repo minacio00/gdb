@@ -17,7 +17,7 @@ GDB is a lightweight, educational database engine implemented in Go. It provides
 
 ```bash
 # Clone the repository
-git clone https://github.com/yourusername/gdb.git
+git clone https://github.com/minacio00/gdb.git
 cd gdb
 
 # Build the project
@@ -35,7 +35,7 @@ import (
 	"fmt"
 	"log"
 	
-	"github.com/yourusername/gdb/storageengine"
+	"github.com/minacio00/gdb/storageengine"
 )
 
 func main() {
